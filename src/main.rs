@@ -10,6 +10,7 @@ use log::{info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    info!("hello");
     let _ = env::set_var("RUST_LOG", RUST_LOG_LEVEL);
     env_logger::init();
     info!("Starting to monitor account: {}", constants::RAYDIUM_LAUNCHPAD_PROGRAM);
