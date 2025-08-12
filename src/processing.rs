@@ -1,471 +1,192 @@
-use crate::constants::RAYDIUM_LAUNCHPAD_PROGRAM;
-use futures::stream::StreamExt;
+use crate::constants::{ORCA_WHIRLPOOL_ADDRESS, METEORA_POOL_ADDRESS, SOL_DECIMALS, USDC_DECIMALS, SOL_MINT, USDC_MINT};
+use futures::{Stream, stream::StreamExt};
 use log::{error, info, warn};
-use std::collections::HashMap;
-use std::fmt;
+use solana_program::pubkey::Pubkey;
+use orca_whirlpools_client::Whirlpool;
 use tonic::Status;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
-use yellowstone_grpc_proto::prelude::SubscribeUpdatePing;
-use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
-const TARGET_IX_TYPES: &[RaydiumInstructionType] = &[
-    RaydiumInstructionType::Initialize,
-    RaydiumInstructionType::MigrateToAmm,
-];
+use yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts};
+use std::sync::Mutex;
+use std::collections::HashMap;
+use std::str::FromStr;
 
-pub async fn process_updates<S>(mut stream: S) -> Result<(), Box<dyn std::error::Error>>
+// Simple price tracking
+static ORCA_LAST_PRICE: Mutex<f64> = Mutex::new(0.0);
+static METEORA_LAST_PRICE: Mutex<f64> = Mutex::new(0.0);
+
+// Meteora LB pool structure (simplified heuristic parser)
+#[derive(Debug)]
+struct MeteoraLBPool {
+    pub reserve_x: u64,
+    pub reserve_y: u64,
+}
+
+impl MeteoraLBPool {
+    fn from_bytes(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        if data.len() < 32 { return Err("Meteora pool data too short".into()); }
+
+        // Heuristic: scan 8-byte aligned u64 pairs, derive price (USDC/SOL) and keep the pair
+        // with a plausible price (1..1000) and highest geometric mean liquidity.
+        let mut best: Option<(u64,u64,f64,f64,usize)> = None; // (x,y,price,geo_mean,offset)
+
+        for i in (0..data.len().saturating_sub(15)).step_by(8) {
+            if i + 15 >= data.len() { break; }
+            let reserve_x = u64::from_le_bytes(data[i..i+8].try_into()?);
+            let reserve_y = u64::from_le_bytes(data[i+8..i+16].try_into()?);
+            if reserve_x == 0 || reserve_y == 0 { continue; }
+            // Filter obviously huge numbers (likely not reserves)
+            if reserve_x > 10_000_000_000_000 || reserve_y > 10_000_000_000_000 { continue; }
+
+            let price = (reserve_y as f64 / 10f64.powi(USDC_DECIMALS as i32)) /
+                        (reserve_x as f64 / 10f64.powi(SOL_DECIMALS as i32));
+            if !(1.0..=1000.0).contains(&price) { continue; }
+            let norm_x = reserve_x as f64 / 10f64.powi(SOL_DECIMALS as i32);
+            let norm_y = reserve_y as f64 / 10f64.powi(USDC_DECIMALS as i32);
+            let geo = (norm_x * norm_y).sqrt();
+            match &best {
+                Some((_,_,_,best_geo,_)) if geo <= *best_geo => {},
+                _ => best = Some((reserve_x,reserve_y,price,geo,i)),
+            }
+        }
+
+        if let Some((rx,ry,price,_geo,off)) = best {
+            info!("[METEORA] Chosen reserves offset {} rx={} ry={} price={:.2}", off, rx, ry, price);
+            Ok(MeteoraLBPool { reserve_x: rx, reserve_y: ry })
+        } else {
+            Err("No plausible reserves found".into())
+        }
+    }
+
+    fn calculate_price(&self) -> f64 {
+        if self.reserve_x == 0 || self.reserve_y == 0 { return 0.0; }
+        (self.reserve_y as f64 / 10f64.powi(USDC_DECIMALS as i32)) /
+        (self.reserve_x as f64 / 10f64.powi(SOL_DECIMALS as i32))
+    }
+}
+
+fn format_price(p: f64) -> String { format!("{:.6}", p) }
+
+fn log_arbitrage_opportunity() {
+    let orca_price = *ORCA_LAST_PRICE.lock().unwrap();
+    let meteora_price = *METEORA_LAST_PRICE.lock().unwrap();
+    if orca_price > 0.0 && meteora_price > 0.0 {
+        let price_diff = (meteora_price - orca_price).abs();
+        let profit_usdc = price_diff * 1.0; // 1 SOL size
+        info!("=== PRICE COMPARISON ===");
+        info!("Orca USDC/SOL: {}", format_price(orca_price));
+        info!("Meteora USDC/SOL: {}", format_price(meteora_price));
+        info!("Price Difference: {:.6} USDC", price_diff);
+        info!("Potential Profit (1 SOL): {:.6} USDC", profit_usdc);
+        if profit_usdc > 1.0 { info!("Arb opportunity ( > 1 USDC )"); }
+        info!("========================");
+    }
+}
+
+// Main stream processing loop
+pub async fn process_updates<S, T>(mut stream: S, tx: &mut T) -> Result<(), Box<dyn std::error::Error>>
 where
-    S: StreamExt<Item = Result<SubscribeUpdate, Status>> + Unpin,
+    S: Stream<Item = Result<SubscribeUpdate, Status>> + Unpin,
+    T: futures::sink::SinkExt<SubscribeRequest> + Unpin,
+    <T as futures::Sink<SubscribeRequest>>::Error: std::error::Error + 'static,
 {
+    let mut accounts_filter = HashMap::new();
+    accounts_filter.insert(
+        "pools".to_string(),
+        SubscribeRequestFilterAccounts {
+            account: vec![ORCA_WHIRLPOOL_ADDRESS.to_string(), METEORA_POOL_ADDRESS.to_string()],
+            owner: vec![],
+            filters: vec![],
+            nonempty_txn_signature: None,
+        },
+    );
+
+    tx.send(SubscribeRequest {
+        accounts: accounts_filter,
+        transactions: HashMap::new(),
+        commitment: Some(CommitmentLevel::Processed as i32),
+        ..Default::default()
+    }).await?;
+
+    info!("Subscribed to Orca and Meteora pools");
+
     while let Some(message) = stream.next().await {
         match message {
-            Ok(msg) => handle_message(msg)?,
-            Err(e) => {
-                error!("Error receiving message: {:?}", e);
-                break;
-            }
+            Ok(msg) => { if let Err(e) = handle_message(msg) { error!("Error handling message: {:?}", e); } }
+            Err(e) => { error!("Stream error: {:?}", e); break; }
         }
     }
     Ok(())
+}
+
+fn compute_orca_price(state: &Whirlpool) -> f64 {
+    // sqrt_price is Q64.64; ratio = (sqrt_price^2 / 2^128).
+    let sqrt_price = state.sqrt_price as f64;
+    let ratio = (sqrt_price * sqrt_price) / 2f64.powi(128);
+    // Determine which mint is SOL / USDC to orient price as USDC per SOL.
+    let mint_a = bs58::encode(state.token_mint_a).into_string();
+    let mint_b = bs58::encode(state.token_mint_b).into_string();
+    let dec_a = if mint_a == SOL_MINT { SOL_DECIMALS } else if mint_a == USDC_MINT { USDC_DECIMALS } else { 9 };
+    let dec_b = if mint_b == SOL_MINT { SOL_DECIMALS } else if mint_b == USDC_MINT { USDC_DECIMALS } else { 9 };
+    let ratio_adjusted = ratio * 10f64.powi(dec_b as i32 - dec_a as i32);
+
+    // ratio_adjusted = token_b per token_a
+    // We want USDC per SOL.
+    let mut candidates = vec![];
+    if mint_a == SOL_MINT && mint_b == USDC_MINT { // SOL -> USDC directly
+        candidates.push(ratio_adjusted);
+    } else if mint_a == USDC_MINT && mint_b == SOL_MINT { // need inverse
+        candidates.push(1.0 / ratio_adjusted);
+    } else {
+        // Unknown ordering: consider both orientations, pick plausible USD price
+        candidates.push(ratio_adjusted);
+        if ratio_adjusted > 0.0 { candidates.push(1.0 / ratio_adjusted); }
+    }
+    // Choose candidate in plausible USD price range 1..1000 closest to 200 else fallback first.
+    candidates.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut best = candidates[0];
+    let mut best_diff = f64::INFINITY;
+    for c in &candidates {
+        if (1.0..=1000.0).contains(c) {
+            let d = (c - 200.0).abs();
+            if d < best_diff { best_diff = d; best = *c; }
+        }
+    }
+    best
 }
 
 fn handle_message(msg: SubscribeUpdate) -> Result<(), Box<dyn std::error::Error>> {
-    match msg.update_oneof {
-        Some(UpdateOneof::Transaction(transaction_update)) => {
-            match TransactionParser::parse_transaction(&transaction_update) {
-                Ok(parsed_tx) => {
-                    let mut has_raydium_ix = false;
-                    let mut found_target_ix = false;
-                    let mut found_ix_types = Vec::new();
+    let update = match msg.update_oneof { Some(u) => u, None => return Ok(()), };
+    if let UpdateOneof::Account(account_update) = update {
+        let account = match account_update.account { Some(a) => a, None => return Ok(()), };
+        let account_pubkey = Pubkey::new_from_array(account.pubkey[..32].try_into().unwrap());
+        let account_pubkey_str = account_pubkey.to_string();
+        let account_data = &account.data;
 
-                    if TARGET_IX_TYPES.is_empty() {
-                        found_target_ix = true;
-                    }
-
-                    for (i, ix) in parsed_tx.instructions.iter().enumerate() {
-                        if ix.program_id == RAYDIUM_LAUNCHPAD_PROGRAM {
-                            has_raydium_ix = true;
-                            let raydium_ix_type = parse_raydium_instruction_type(&ix.data);
-                            found_ix_types.push(raydium_ix_type.clone());
-
-                            if TARGET_IX_TYPES.contains(&raydium_ix_type) {
-                                found_target_ix = true;
-                            }
-                            if found_target_ix {
-                                info!(
-                                    "Found target instruction: {} at index {}",
-                                    raydium_ix_type, i
-                                );
-                            }
-                        }
-                    }
-
-                    for inner_ix_group in &parsed_tx.inner_instructions {
-                        for (i, inner_ix) in inner_ix_group.instructions.iter().enumerate() {
-                            if inner_ix.program_id == RAYDIUM_LAUNCHPAD_PROGRAM {
-                                has_raydium_ix = true;
-                                let raydium_ix_type =
-                                    parse_raydium_instruction_type(&inner_ix.data);
-                                found_ix_types.push(raydium_ix_type.clone());
-
-                                if TARGET_IX_TYPES.contains(&raydium_ix_type) {
-                                    found_target_ix = true;
-                                }
-                                if found_target_ix
-                                    && !matches!(
-                                        raydium_ix_type,
-                                        RaydiumInstructionType::Unknown(_)
-                                    )
-                                {
-                                    info!(
-                                        "Found target instruction: {} at inner index {}.{}",
-                                        raydium_ix_type, inner_ix_group.instruction_index, i
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if found_target_ix && has_raydium_ix {
-                        info!("Found Raydium Launchpad transaction!");
-                        info!("Parsed Transaction:\n{}", parsed_tx);
+        if account_pubkey_str == ORCA_WHIRLPOOL_ADDRESS {
+            match Whirlpool::from_bytes(account_data) {
+                Ok(whirlpool_state) => {
+                    let price = compute_orca_price(&whirlpool_state);
+                    if price > 0.0 {
+                        *ORCA_LAST_PRICE.lock().unwrap() = price;
+                        info!("[ORCA] Price: {} USDC/SOL", format_price(price));
+                        log_arbitrage_opportunity();
                     }
                 }
-                Err(e) => {
-                    error!("Failed to parse transaction: {:?}", e);
+                Err(e) => error!("[ORCA PARSE ERROR] {}", e),
+            }
+        } else if account_pubkey_str == METEORA_POOL_ADDRESS {
+            match MeteoraLBPool::from_bytes(account_data) {
+                Ok(lb_pool) => {
+                    let price = lb_pool.calculate_price();
+                    if price > 0.0 {
+                        *METEORA_LAST_PRICE.lock().unwrap() = price;
+                        info!("[METEORA] Price: {} USDC/SOL (Reserve X: {}, Reserve Y: {})", format_price(price), lb_pool.reserve_x, lb_pool.reserve_y);
+                        log_arbitrage_opportunity();
+                    }
                 }
+                Err(e) => warn!("[METEORA PARSE WARN] {}", e),
             }
         }
-        Some(UpdateOneof::Ping(SubscribeUpdatePing {})) => {
-            // Ignore pings
-        }
-        Some(other) => {
-            info!("Unexpected update received. Type of update: {:?}", other);
-        }
-        None => {
-            warn!("Empty update received");
-        }
     }
-
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RaydiumInstructionType {
-    Initialize,
-    BuyExactIn,
-    BuyExactOut,
-    SellExactIn,
-    SellExactOut,
-    ClaimPlatformFee,
-    ClaimVestedToken,
-    CollectFee,
-    CollectMigrateFee,
-    CreateConfig,
-    CreatePlatformConfig,
-    CreateVestingAccount,
-    MigrateToAmm,
-    MigrateToCpswap,
-    UpdateConfig,
-    UpdatePlatformConfig,
-    Unknown([u8; 8]),
-}
-
-pub fn parse_raydium_instruction_type(data: &[u8]) -> RaydiumInstructionType {
-    if data.len() < 8 {
-        return RaydiumInstructionType::Unknown([0; 8]);
-    }
-
-    let mut discriminator = [0u8; 8];
-    discriminator.copy_from_slice(&data[0..8]);
-
-    match discriminator {
-        [175, 175, 109, 31, 13, 152, 155, 237] => RaydiumInstructionType::Initialize,
-        [250, 234, 13, 123, 213, 156, 19, 236] => RaydiumInstructionType::BuyExactIn,
-        [24, 211, 116, 40, 105, 3, 153, 56] => RaydiumInstructionType::BuyExactOut,
-        [149, 39, 222, 155, 211, 124, 152, 26] => RaydiumInstructionType::SellExactIn,
-        [95, 200, 71, 34, 8, 9, 11, 166] => RaydiumInstructionType::SellExactOut,
-        [156, 39, 208, 135, 76, 237, 61, 72] => RaydiumInstructionType::ClaimPlatformFee,
-        [49, 33, 104, 30, 189, 157, 79, 35] => RaydiumInstructionType::ClaimVestedToken,
-        [60, 173, 247, 103, 4, 93, 130, 48] => RaydiumInstructionType::CollectFee,
-        [255, 186, 150, 223, 235, 118, 201, 186] => RaydiumInstructionType::CollectMigrateFee,
-        [201, 207, 243, 114, 75, 111, 47, 189] => RaydiumInstructionType::CreateConfig,
-        [176, 90, 196, 175, 253, 113, 220, 20] => RaydiumInstructionType::CreatePlatformConfig,
-        [129, 178, 2, 13, 217, 172, 230, 218] => RaydiumInstructionType::CreateVestingAccount,
-        [207, 82, 192, 145, 254, 207, 145, 223] => RaydiumInstructionType::MigrateToAmm,
-        [136, 92, 200, 103, 28, 218, 144, 140] => RaydiumInstructionType::MigrateToCpswap,
-        [29, 158, 252, 191, 10, 83, 219, 99] => RaydiumInstructionType::UpdateConfig,
-        [195, 60, 76, 129, 146, 45, 67, 143] => RaydiumInstructionType::UpdatePlatformConfig,
-        _ => RaydiumInstructionType::Unknown(discriminator),
-    }
-}
-
-impl std::fmt::Display for RaydiumInstructionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RaydiumInstructionType::Initialize => write!(f, "Initialize"),
-            RaydiumInstructionType::BuyExactIn => write!(f, "BuyExactIn"),
-            RaydiumInstructionType::BuyExactOut => write!(f, "BuyExactOut"),
-            RaydiumInstructionType::SellExactIn => write!(f, "SellExactIn"),
-            RaydiumInstructionType::SellExactOut => write!(f, "SellExactOut"),
-            RaydiumInstructionType::ClaimPlatformFee => write!(f, "ClaimPlatformFee"),
-            RaydiumInstructionType::ClaimVestedToken => write!(f, "ClaimVestedToken"),
-            RaydiumInstructionType::CollectFee => write!(f, "CollectFee"),
-            RaydiumInstructionType::CollectMigrateFee => write!(f, "CollectMigrateFee"),
-            RaydiumInstructionType::CreateConfig => write!(f, "CreateConfig"),
-            RaydiumInstructionType::CreatePlatformConfig => write!(f, "CreatePlatformConfig"),
-            RaydiumInstructionType::CreateVestingAccount => write!(f, "CreateVestingAccount"),
-            RaydiumInstructionType::MigrateToAmm => write!(f, "MigrateToAmm"),
-            RaydiumInstructionType::MigrateToCpswap => write!(f, "MigrateToCpswap"),
-            RaydiumInstructionType::UpdateConfig => write!(f, "UpdateConfig"),
-            RaydiumInstructionType::UpdatePlatformConfig => write!(f, "UpdatePlatformConfig"),
-            RaydiumInstructionType::Unknown(discriminator) => {
-                write!(f, "Unknown(discriminator={:?})", discriminator)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ParsedTransaction {
-    signature: String,
-    is_vote: bool,
-    account_keys: Vec<String>,
-    recent_blockhash: String,
-    instructions: Vec<ParsedInstruction>,
-    success: bool,
-    fee: u64,
-    pre_token_balances: Vec<ParsedTokenBalance>,
-    post_token_balances: Vec<ParsedTokenBalance>,
-    logs: Vec<String>,
-    inner_instructions: Vec<ParsedInnerInstruction>,
-    slot: u64,
-}
-
-impl fmt::Display for ParsedTransaction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Transaction: {}", self.signature)?;
-        writeln!(
-            f,
-            "Status: {}",
-            if self.success { "Success" } else { "Failed" }
-        )?;
-        writeln!(f, "Slot: {}", self.slot)?;
-        writeln!(f, "Fee: {} lamports", self.fee)?;
-
-        writeln!(f, "\nAccount Keys:")?;
-        for (i, key) in self.account_keys.iter().enumerate() {
-            writeln!(f, "  [{}] {}", i, key)?;
-        }
-
-        writeln!(f, "\nInstructions:")?;
-        for (i, ix) in self.instructions.iter().enumerate() {
-            writeln!(f, "  Instruction {}:", i)?;
-            writeln!(
-                f,
-                "    Program: {} (index: {})",
-                ix.program_id, ix.program_id_index
-            )?;
-            writeln!(f, "    Accounts:")?;
-            for (idx, acc) in &ix.accounts {
-                writeln!(f, "      [{}] {}", idx, acc)?;
-            }
-            writeln!(f, "    Data: {} bytes", ix.data.len())?;
-        }
-
-        if !self.inner_instructions.is_empty() {
-            writeln!(f, "\nInner Instructions:")?;
-            for inner_ix in &self.inner_instructions {
-                writeln!(f, "  Instruction Index: {}", inner_ix.instruction_index)?;
-                for (i, ix) in inner_ix.instructions.iter().enumerate() {
-                    writeln!(f, "    Inner Instruction {}:", i)?;
-                    writeln!(
-                        f,
-                        "      Program: {} (index: {})",
-                        ix.program_id, ix.program_id_index
-                    )?;
-                    writeln!(f, "      Accounts:")?;
-                    for (idx, acc) in &ix.accounts {
-                        writeln!(f, "        [{}] {}", idx, acc)?;
-                    }
-                    writeln!(f, "      Data: {} bytes", ix.data.len())?;
-                }
-            }
-        }
-
-        if !self.pre_token_balances.is_empty() || !self.post_token_balances.is_empty() {
-            writeln!(f, "\nToken Balances:")?;
-
-            let mut balance_changes = HashMap::new();
-
-            for balance in &self.pre_token_balances {
-                let key = (balance.account_index, balance.mint.clone());
-                balance_changes.insert(key, (balance.amount.clone(), "".to_string()));
-            }
-
-            for balance in &self.post_token_balances {
-                let key = (balance.account_index, balance.mint.clone());
-
-                if let Some((_, post)) = balance_changes.get_mut(&key) {
-                    *post = balance.amount.clone();
-                } else {
-                    balance_changes.insert(key, ("".to_string(), balance.amount.clone()));
-                }
-            }
-
-            for ((account_idx, mint), (pre_amount, post_amount)) in balance_changes {
-                let account_key = if (account_idx as usize) < self.account_keys.len() {
-                    &self.account_keys[account_idx as usize]
-                } else {
-                    "unknown"
-                };
-
-                if pre_amount.is_empty() {
-                    writeln!(
-                        f,
-                        "  Account {} ({}): new balance {} (mint: {})",
-                        account_idx, account_key, post_amount, mint
-                    )?;
-                } else if post_amount.is_empty() {
-                    writeln!(
-                        f,
-                        "  Account {} ({}): removed balance {} (mint: {})",
-                        account_idx, account_key, pre_amount, mint
-                    )?;
-                } else {
-                    writeln!(
-                        f,
-                        "  Account {} ({}): {} → {} (mint: {})",
-                        account_idx, account_key, pre_amount, post_amount, mint
-                    )?;
-                }
-            }
-        }
-
-        if !self.logs.is_empty() {
-            writeln!(f, "\nTransaction Logs:")?;
-            for (i, log) in self.logs.iter().enumerate() {
-                writeln!(f, "  [{}] {}", i, log)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct ParsedInstruction {
-    program_id: String,
-    program_id_index: u8,
-    accounts: Vec<(usize, String)>, // (index, pubkey)
-    data: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct ParsedInnerInstruction {
-    instruction_index: u8,
-    instructions: Vec<ParsedInstruction>,
-}
-
-#[derive(Debug)]
-struct ParsedTokenBalance {
-    account_index: u32,
-    mint: String,
-    owner: String,
-    amount: String,
-}
-
-struct TransactionParser;
-
-impl TransactionParser {
-    pub fn parse_transaction(
-        tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
-    ) -> Result<ParsedTransaction, Box<dyn std::error::Error>> {
-        let mut parsed_tx = ParsedTransaction::default();
-        parsed_tx.slot = tx_update.slot;
-
-        if let Some(tx_info) = &tx_update.transaction {
-            parsed_tx.is_vote = tx_info.is_vote;
-
-            parsed_tx.signature = bs58::encode(&tx_info.signature).into_string();
-
-            if let Some(tx) = &tx_info.transaction {
-                if let Some(msg) = &tx.message {
-                    for key in &msg.account_keys {
-                        parsed_tx.account_keys.push(bs58::encode(key).into_string());
-                    }
-
-                    if let Some(meta) = &tx_info.meta {
-                        for addr in &meta.loaded_writable_addresses {
-                            let base58_addr = bs58::encode(addr).into_string();
-                            parsed_tx.account_keys.push(base58_addr);
-                        }
-
-                        for addr in &meta.loaded_readonly_addresses {
-                            let base58_addr = bs58::encode(addr).into_string();
-                            parsed_tx.account_keys.push(base58_addr);
-                        }
-                    }
-
-                    parsed_tx.recent_blockhash = bs58::encode(&msg.recent_blockhash).into_string();
-
-                    for ix in &msg.instructions {
-                        let program_id_index = ix.program_id_index;
-                        let program_id =
-                            if (program_id_index as usize) < parsed_tx.account_keys.len() {
-                                parsed_tx.account_keys[program_id_index as usize].clone()
-                            } else {
-                                "unknown".to_string()
-                            };
-
-                        let mut accounts = Vec::new();
-                        for &acc_idx in &ix.accounts {
-                            let account_idx = acc_idx as usize;
-                            if account_idx < parsed_tx.account_keys.len() {
-                                accounts.push((
-                                    account_idx,
-                                    parsed_tx.account_keys[account_idx].clone(),
-                                ));
-                            }
-                        }
-
-                        parsed_tx.instructions.push(ParsedInstruction {
-                            program_id,
-                            program_id_index: program_id_index as u8,
-                            accounts,
-                            data: ix.data.clone(),
-                        });
-                    }
-                }
-            }
-
-            if let Some(meta) = &tx_info.meta {
-                parsed_tx.success = meta.err.is_none();
-                parsed_tx.fee = meta.fee;
-
-                for balance in &meta.pre_token_balances {
-                    if let Some(amount) = &balance.ui_token_amount {
-                        parsed_tx.pre_token_balances.push(ParsedTokenBalance {
-                            account_index: balance.account_index,
-                            mint: balance.mint.clone(),
-                            owner: balance.owner.clone(),
-                            amount: amount.ui_amount_string.clone(),
-                        });
-                    }
-                }
-
-                for balance in &meta.post_token_balances {
-                    if let Some(amount) = &balance.ui_token_amount {
-                        parsed_tx.post_token_balances.push(ParsedTokenBalance {
-                            account_index: balance.account_index,
-                            mint: balance.mint.clone(),
-                            owner: balance.owner.clone(),
-                            amount: amount.ui_amount_string.clone(),
-                        });
-                    }
-                }
-
-                for inner_ix in &meta.inner_instructions {
-                    let mut parsed_inner_ixs = Vec::new();
-
-                    for ix in &inner_ix.instructions {
-                        let program_id_index = ix.program_id_index;
-
-                        let program_id =
-                            if (program_id_index as usize) < parsed_tx.account_keys.len() {
-                                parsed_tx.account_keys[program_id_index as usize].clone()
-                            } else {
-                                "unknown".to_string()
-                            };
-
-                        let mut accounts = Vec::new();
-                        for &acc_idx in &ix.accounts {
-                            let account_idx = acc_idx as usize;
-                            if account_idx < parsed_tx.account_keys.len() {
-                                accounts.push((
-                                    account_idx,
-                                    parsed_tx.account_keys[account_idx].clone(),
-                                ));
-                            }
-                        }
-
-                        parsed_inner_ixs.push(ParsedInstruction {
-                            program_id,
-                            program_id_index: program_id_index as u8,
-                            accounts,
-                            data: ix.data.clone(),
-                        });
-                    }
-
-                    parsed_tx.inner_instructions.push(ParsedInnerInstruction {
-                        instruction_index: inner_ix.index as u8,
-                        instructions: parsed_inner_ixs,
-                    });
-                }
-
-                parsed_tx.logs = meta.log_messages.clone();
-            }
-        }
-
-        Ok(parsed_tx)
-    }
 }
